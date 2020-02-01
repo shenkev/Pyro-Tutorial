@@ -2,10 +2,12 @@ import torch
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
+from torch.distributions import constraints
+from tqdm import tqdm
 
 import pyro
 from pyro.infer import Importance
-import pyro.optim
+import pyro.optim as optim
 import pyro.distributions as dist
 
 
@@ -114,11 +116,12 @@ def intervene_wrapper(measurement=9.5):
 # in our example above, there is a closed form solution for the posterior, let's make that the
 # guide
 
+def true_mean_std(guess, measurement):
+    return (0.75**2 * guess + measurement) / (1 + 0.75**2), np.sqrt(0.75**2/(1 + 0.75**2))
+
 def perfect_guide(measurement=9.5):
-    return lambda guess: pyro.sample(
-        "weight",
-        dist.Normal((0.75**2 * guess + measurement) / (1 + 0.75**2),
-        np.sqrt(0.75**2/(1 + 0.75**2))))
+    mean, std = true_mean_std(guess, measurement)
+    return lambda guess: pyro.sample("weight",  dist.Normal(mean, std))
 
 
 def perfect_intervention_guide(guess):
@@ -150,7 +153,7 @@ def plot3D(data):
     plt.show()
 
 doIS = False
-if doIS == True:
+if doIS:
 
     N = 100
 
@@ -177,9 +180,82 @@ if doIS == True:
     wrong = run_IS(intervene_wrapper(measure_int), perfect_guide(9.5), guess=guess_obs, samples=N)
     plot3D(np.stack([guess_obs*np.ones(N), guess5_domeasure95_post, measure_int*np.ones(N)], axis=1))
 
+
 # Variational Inference
+# Everything has worked decently thus far except the fact that importance sampling broke down when
+# the guide function was not good enough.
 # VI is essentially the technique whereby instead of specifying a guide, you specify a family of
 # functions to approximate the posterior instead, your "guide" is the loss function that pushes
 # the variational model towards the true posterior. The parameters of the model are learned.
 # Note: VI is not the same as fitting the dynamics in computing countefactuals, it's a choice of
 # inference technique, we can potentially use VI in abduction.
+
+# The paradigmn of VI requires to define an approximate posterior distribution (in this case
+# Gaussian). The approximate posterior is now considered the "guide". The guide is no longer
+# a proposal distribution but an approximation to the true posterior with learnable params.
+
+def scale_parametrized_guide(guess):
+    a = pyro.param("a", torch.tensor(1.))  # guess is a required param but you don't need to use it
+    # a = pyro.param("a", torch.tensor(guess))  # not necessary to use the guess here
+    b = pyro.param("b", torch.tensor(1.), constraint=constraints.positive)
+    return pyro.sample("weight", dist.Normal(a, b))
+# we are explicitly defining a distribution for variable "weight", notice how Pyro works by
+# matching the variable name "weight" in the approx-post to the "weight" in the data generating
+# stocfun.
+
+def run_SVI(model, guide, guess=5, num_steps=2500, lr=0.001, mom=0.1):
+    # make sure all learnable parameters are reset
+    pyro.clear_param_store()
+    # 
+    svi = pyro.infer.SVI(model=model,
+                        guide=guide,
+                        optim=optim.SGD({"lr": lr, "momentum": mom}),
+                        loss=pyro.infer.Trace_ELBO())
+
+
+    losses, a,b  = [], [], []
+    
+    for _ in tqdm(range(num_steps)):
+        losses.append(svi.step(guess))
+        a.append(pyro.param("a").item())
+        b.append(pyro.param("b").item())
+
+    plt.plot(losses)
+    plt.title("ELBO")
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    print('a = ', pyro.param("a").item())
+    print('b = ', pyro.param("b").item())
+    plt.show()
+
+    plt.subplot(1,2,1)
+    plt.plot([0, num_steps],[9.14, 9.14], 'k:')
+    plt.plot(a)
+    plt.ylabel('a')
+
+    plt.subplot(1,2,2)
+    plt.ylabel('b')
+    plt.plot([0,num_steps],[0.6, 0.6], 'k:')
+    plt.plot(b)
+    plt.tight_layout()
+
+    plt.show()
+
+doSVI = True
+if doSVI:
+
+    guess_obs = 5.
+    measure_obs = 1000
+    run_SVI(condition_wrapper(measurement=measure_obs), scale_parametrized_guide, guess=guess_obs)
+    print(true_mean_std(guess_obs, measure_obs))
+
+    # the performance is actually quite robust to the initial guess for the mean of the posterior
+    # it doesn't need to be guess_obs, in this case we set it to 1 and it still works well
+    # one criticism is "of course it works well, we've picked the perfect approx-post family"
+
+    guess_obs = 5.
+    measure_int = 1000
+    run_SVI(intervene_wrapper(measurement=measure_int), scale_parametrized_guide, guess=guess_obs, lr=0.0003, mom=0.9)
+    print(5, 1)  # true intervention mean and std
+
+    # the intervention posterior is actually very noisy and doesn't converge well
